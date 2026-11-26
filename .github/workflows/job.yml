@@ -1,0 +1,104 @@
+name: job
+
+on:
+  workflow_dispatch:
+    inputs:
+      race:
+        description: "IDs (leer = alle)"
+        required: false
+        default: ""
+      force:
+        type: boolean
+        default: false
+      inspect:
+        description: "IDs nur prüfen"
+        required: false
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: job
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      # Code und Daten liegen im privaten Repo; dieses öffentliche Repo enthält nur diese Datei.
+      # Es wird nichts aus dem Crawler ins Log geschrieben – alles geht ins private Repo.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SRC_REPO }}
+          token: ${{ secrets.SRC_TOKEN }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: setup
+        run: pip install -q -r requirements.txt > /dev/null 2>&1
+
+      - name: run
+        env:
+          RACE: ${{ inputs.race }}
+          FORCE: ${{ inputs.force }}
+          INSPECT: ${{ inputs.inspect }}
+        run: |
+          mkdir -p data/logs
+          LOG=data/logs/last-run.log
+          if [ -n "$INSPECT" ]; then
+            rm -rf data/debug
+            read -ra IDS <<< "$INSPECT"
+            python -m crawler inspect "${IDS[@]}" > "$LOG" 2>&1
+            echo "inspect=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          ARGS=()
+          if [ -n "$RACE" ]; then read -ra IDS <<< "$RACE"; ARGS+=(--race "${IDS[@]}"); fi
+          if [ "$FORCE" = "true" ]; then ARGS+=(--force); fi
+          set +e
+          python -m crawler run "${ARGS[@]}" > "$LOG" 2>&1
+          CODE=$?
+          echo "exit=$CODE"
+          # Exit 2 = Regressionssperre: Bestand geschrumpft -> nichts veröffentlichen
+          exit $CODE
+
+      - name: save
+        if: always()
+        run: |
+          git config user.name  "results-bot"
+          git config user.email "results-bot@users.noreply.github.com"
+          git rm -r -q --cached data/debug 2>/dev/null || true
+          for f in data/state.json data/discovered.json data/funnel.json data/REPORT.md data/editions data/debug \
+                   data/logs data/export/percentiles.csv data/export/percentiles.json \
+                   data/export/summary.csv data/export/summary.json data/export/races.csv \
+                   data/export/manifest.json; do
+            [ -e "$f" ] && git add -f "$f"
+          done
+          git diff --cached --quiet || git commit -q -m "Daten-Update $(date -u +%Y-%m-%d)"
+          for i in 1 2 3 4 5; do
+            git pull -q --rebase -X theirs origin main > /dev/null 2>&1 && git push -q > /dev/null 2>&1 && exit 0
+            echo "retry $i"
+            git rebase --abort 2>/dev/null || true
+            sleep $((i * 20))
+          done
+          echo "::error::save failed"; exit 1
+
+      - name: publish
+        if: env.inspect != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SRC_TOKEN }}
+          SRC: ${{ secrets.SRC_REPO }}
+        run: |
+          gh release view daten-aktuell -R "$SRC" >/dev/null 2>&1 || \
+            gh release create daten-aktuell -R "$SRC" --title "Laufergebnisse – aktueller Stand" \
+              --notes "Wird automatisch täglich aktualisiert. Siehe data/REPORT.md." > /dev/null
+          for i in 1 2 3 4; do
+            gh release upload daten-aktuell data/export/* -R "$SRC" --clobber > /dev/null 2>&1 && exit 0
+            echo "retry $i"; sleep $((i * 30))
+          done
+          exit 1
